@@ -1,0 +1,218 @@
+function [q_solutions, valid] = inverseKinematics3DOF(x_ee, y_ee, phi_deg, link_length, silent)
+    L1 = link_length(1);
+    L2 = link_length(2);
+    L3 = link_length(3);
+    qlim = [-pi,    pi;
+            -pi,    pi;
+            -pi,    pi];
+
+    phi = deg2rad(phi_deg);
+    fprintf('\n# 3-DOF Planar IK\n');
+    fprintf('  Input  :  X = %.4f m,  Y = %.4f m,  phi = %.1f°\n', x_ee, y_ee, phi_deg);
+    fprintf('  Links  :  L1=%.3f  L2=%.3f  L3=%.3f(in m)\n', L1, L2, L3);
+
+    x_w = x_ee - L3 * cos(phi);
+    y_w = y_ee - L3 * sin(phi);
+    r2  = x_w^2 + y_w^2;
+    r   = sqrt(r2);
+    fprintf('  Wrist  :  Xw = %.4f m,  Yw = %.4f m  (dist = %.4f m)\n', x_w, y_w, r);
+
+    %% Reachability check
+    r_max_2r = L1 + L2;
+    r_min_2r = abs(L1 - L2);
+    % if r > r_max_2r + 1e-6
+    %     fprintf('\n  UNREACHABLE — wrist centre too far.\n');
+    %     fprintf('  Distance = %.4f m  >  L1+L2 = %.4f m\n', r, r_max_2r);
+    %     q_solutions = []; valid = []; return
+    % end
+    % if r < r_min_2r - 1e-6
+    %     fprintf('\n  UNREACHABLE — wrist centre too close.\n');
+    %     fprintf('  Distance = %.4f m  <  |L1-L2| = %.4f m\n', r, r_min_2r);
+    %     q_solutions = []; valid = []; return
+    % end
+
+    %% 2R Analytical IK (cosine rule)
+    cos_q2 = (r2 - L1^2 - L2^2) / (2*L1*L2);
+    cos_q2 = max(-1, min(1, cos_q2));
+    q_solutions = zeros(0,3);
+    for sign_elbow = [+1, -1]
+        q2 = sign_elbow * acos(cos_q2);
+        k1 = L1 + L2*cos(q2);
+        k2 = L2 * sin(q2);
+        q1 = atan2(y_w, x_w) - atan2(k2, k1);
+        q3 = phi - q1 - q2;
+        q_solutions(end+1, :) = [q1, q2, q3];  %#ok<AGROW>
+    end
+
+    %% Wrap & validate
+    nSol  = size(q_solutions,1);
+    valid = false(nSol,1);
+    QLIM_TOL = 1e-3;
+
+    for k = 1:nSol
+        qi = wrapToPi(q_solutions(k,:));
+        q_solutions(k,:) = qi;
+
+        % Joint-limit check
+        lo = qlim(:,1)' - QLIM_TOL;
+        hi = qlim(:,2)' + QLIM_TOL;
+        if ~all(qi >= lo & qi <= hi), continue; end
+
+        % FK verification
+        T_ck    = forwardKinematics(qi', L1, L2, L3);
+        pos_err = norm([T_ck(1,4) - x_ee, T_ck(2,4) - y_ee]);
+        phi_ck  = atan2(T_ck(2,1), T_ck(1,1));
+        ori_err = abs(wrapToPi(phi_ck - phi));
+
+        if pos_err > 1e-4 || ori_err > 1e-3, continue; end
+        valid(k) = true;
+    end
+
+    fprintf('\n');
+    fprintf('  Sol#  q1(deg)  q2(deg)  q3(deg)  Config    Status    FK err\n');
+    fprintf('  %s\n', repmat('-',1,62));
+
+    config_names = {'Elbow-Up  ','Elbow-Down'};
+    for k = 1:nSol
+        T_ck = forwardKinematics(q_solutions(k,:)', L1, L2, L3);
+        pe   = norm([T_ck(1,4)-x_ee, T_ck(2,4)-y_ee]);
+        tag  = 'INVALID';
+        if valid(k), tag = 'VALID  '; end
+        fprintf('  %3d  %7.2f  %7.2f  %7.2f  %s  %s  %.2e\n', ...
+            k, rad2deg(q_solutions(k,1)), ...
+               rad2deg(q_solutions(k,2)), ...
+               rad2deg(q_solutions(k,3)), ...
+               config_names{k}, tag, pe);
+    end
+    fprintf('\n  Valid solutions: %d / %d\n', sum(valid), nSol);
+    for k = 1:nSol
+        if valid(k)
+            plot2D(q_solutions(k, :), link_length, silent);
+        end
+    end
+
+
+end
+
+function T_final = forwardKinematics(q, L1, L2, L3)
+    q = q(:);
+    q1 = q(1);  q2 = q(2);  q3 = q(3);
+    a1 =  q1;
+    a2 =  q1 + q2;
+    a3 =  q1 + q2 + q3;
+
+    P0 = [0; 0];
+    P1 = P0 + L1 * [cos(a1); sin(a1)];
+    P2 = P1 + L2 * [cos(a2); sin(a2)];
+    P3 = P2 + L3 * [cos(a3); sin(a3)];
+
+    T_final = [ cos(a3), -sin(a3), 0,  P3(1);
+                sin(a3),  cos(a3), 0,  P3(2);
+                0,        0,       1,  0;
+                0,        0,       0,  1    ];
+end
+
+function plot2D(q_solution, link_length, silent)
+    if ~silent
+        L1 = link_length(1);
+        L2 = link_length(2);
+        L3 = link_length(3);
+        q1 = q_solution(1);
+        q2 = q_solution(2);
+        q3 = q_solution(3);
+        a1 =  q1;
+        a2 =  q1 + q2;
+        a3 =  q1 + q2 + q3;
+
+        P0 = [0; 0];
+        P1 = P0 + L1 * [cos(a1); sin(a1)];
+        P2 = P1 + L2 * [cos(a2); sin(a2)];
+        P3 = P2 + L3 * [cos(a3); sin(a3)];
+        fprintf('\n');
+        fprintf('# Inverse Kinematics Results  (3-DOF Planar 2D)\n');
+        fprintf('# Joint Angles (in deg):   q1=%7.2f   q2=%7.2f   q3=%7.2f\n', ...
+            rad2deg(q1), rad2deg(q2), rad2deg(q3));
+        fprintf('\n');
+
+        fprintf('  Joint Positions:\n');
+        fprintf('\tBase   : (%.4f,  %.4f) m\n', P0(1), P0(2));
+        fprintf('\tElbow  : (%.4f,  %.4f) m\n', P1(1), P1(2));
+        fprintf('\tWrist  : (%.4f,  %.4f) m\n', P2(1), P2(2));
+        fprintf('\tEnd-Eff: (%.4f,  %.4f) m\n', P3(1), P3(2));
+
+        fprintf('\n');
+        fprintf('  End-Effector:\n');
+        fprintf('\tX     = %8.4f m\n', P3(1));
+        fprintf('\tY     = %8.4f m\n', P3(2));
+        fprintf('\tAngle = %8.2f deg  (orientation in XY plane)\n', rad2deg(a3));
+
+        r_max = L1 + L2 + L3;
+        r_min = abs(L1 - L2 - L3);
+        
+        %% 2D Visualization
+        figFK = figure( ...
+            'Name',        'Inverse Kinematics – 3DOF Planar 2D', ...
+            'NumberTitle', 'off', ...
+            'Color',       'black', ...
+            'Position',    [100 100 700 650]);
+
+        ax = axes('Parent', figFK);
+        hold(ax, 'on');
+        axis(ax, 'equal');
+        grid(ax, 'on');
+
+        % Workspace circles
+        theta_c = linspace(0, 2*pi, 300);
+        plot(ax, r_max * cos(theta_c), r_max * sin(theta_c), ...
+            '--', 'Color', [0.75 0.75 0.75], 'LineWidth', 1.0, ...
+            'DisplayName', sprintf('Max reach (%.3f m)', r_max));
+        if r_min > 0
+            plot(ax, r_min * cos(theta_c), r_min * sin(theta_c), ...
+                ':', 'Color', [0.85 0.75 0.75], 'LineWidth', 1.0, ...
+                'DisplayName', sprintf('Min reach (%.3f m)', r_min));
+        end
+
+        % Links
+        pts = [P0, P1, P2, P3];
+        plot(ax, pts(1,:), pts(2,:), ...
+            '-o', ...
+            'Color',           [0.15 0.35 0.70], ...
+            'LineWidth',       3.0, ...
+            'MarkerSize',      8, ...
+            'MarkerFaceColor', [0.15 0.35 0.70], ...
+            'DisplayName',     'Links');
+
+        % Joint labels
+        labels = {'Base','J1','J2','J3 (EE)'};
+        offsets = [0.02, 0.02; 0.02, 0.02; 0.02, 0.02; 0.02, 0.02];
+        for k = 1:4
+            text(ax, pts(1,k)+offsets(k,1), pts(2,k)+offsets(k,2), ...
+                labels{k}, ...
+                'FontSize',   9, ...
+                'FontWeight', 'bold', ...
+                'Color',      [0.15 0.35 0.70]);
+        end
+
+        % End-effector marker
+        scatter(ax, P3(1), P3(2), 180, 'r', 'filled', ...
+            'DisplayName', 'End-Effector');
+
+        % EE orientation arrow
+        arrow_len = 0.05;
+        quiver(ax, P3(1), P3(2), ...
+               arrow_len*cos(a3), arrow_len*sin(a3), ...
+               0, 'r', 'LineWidth', 2, 'MaxHeadSize', 0.8, ...
+               'DisplayName', 'EE orientation');
+
+        % Base marker
+        scatter(ax, 0, 0, 120, 'ks', 'filled', 'DisplayName', 'Base');
+
+        title(ax, sprintf('IK 2D  |  q = [%.1f°, %.1f°, %.1f°]', ...
+              rad2deg(q1), rad2deg(q2), rad2deg(q3)), ...
+              'FontSize', 13);
+        xlabel(ax, 'X (m)');
+        ylabel(ax, 'Y (m)');
+        legend(ax, 'Location', 'northeast');
+        hold(ax, 'off');
+    end
+end
