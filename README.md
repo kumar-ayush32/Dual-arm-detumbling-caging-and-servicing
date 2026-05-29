@@ -1,1 +1,1 @@
-# Dual-arm-detumbling--caging-and-servicing
+# Dual-arm-detumbling-caging-and-servicing
