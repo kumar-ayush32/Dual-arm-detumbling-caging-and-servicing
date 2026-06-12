@@ -1,0 +1,11 @@
+mujoco_env/
+Mujoco_simulation/mujoco-3.9.0-windows-x86_64/
+*.mp4
+*.pdf
+*.docx
+Paper/
+Code/
+Document/
+S260079/
+MATLAB_space_debri_capturing_sim/
+piper_isaac_sim/
