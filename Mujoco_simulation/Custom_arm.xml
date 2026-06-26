@@ -1,0 +1,193 @@
+<mujoco model="dual_arm_space">
+    <option gravity="0 0 0"
+            timestep="0.001"
+            integrator="implicitfast"
+            cone="elliptic"
+            iterations="50"
+            tolerance="1e-8"/>
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+        <rgba haze="0.05 0.05 0.15 1"/>
+        <global azimuth="-130" elevation="-60"/>
+    </visual>
+
+    <asset>
+        <texture name="skybox" type="skybox" builtin="gradient"
+                 rgb1="0.00 0.00 0.05" rgb2="0.02 0.04 0.12"
+                 width="800" height="800"/>
+
+        <texture name="planecheck" type="2d" builtin="checker" mark="edge"
+                 markrgb="0.20 0.22 0.30"
+                 rgb1="0.06 0.07 0.12" rgb2="0.09 0.10 0.18"
+                 width="600" height="600"/>
+        <material name="planemat" texture="planecheck"
+                  texuniform="true" texrepeat="12 12" reflectance="0.08"/>
+
+        <mesh name="RobotBase" file="meshess/RobotBase.obj"/>
+        <mesh name="LinkR1"    file="meshess/LinkR1.obj"/>
+        <mesh name="LinkR2"    file="meshess/LinkR2.obj"/>
+        <mesh name="LinkR3"    file="meshess/LinkR3.obj"/>
+        <mesh name="LinkL1"    file="meshess/LinkL1.obj"/>
+        <mesh name="LinkL2"    file="meshess/LinkL2.obj"/>
+        <mesh name="LinkL3"    file="meshess/LinkL3.obj"/>
+        <mesh name="EE_R"      file="meshess/EE_R.obj"/>
+        <mesh name="EE_L"      file="meshess/EE_L.obj"/>
+        <mesh name="Target"    file="meshess/target.obj"/>
+    </asset>
+
+    <contact>
+        <exclude body1="platform"  body2="Hindarm_a"/>
+        <exclude body1="Hindarm_a" body2="LinkR2"/>
+        <exclude body1="LinkR2"    body2="LinkR3"/>
+        <exclude body1="LinkR3"    body2="Gripper_a"/>
+        <exclude body1="platform"  body2="Hindarm_b"/>
+        <exclude body1="Hindarm_b" body2="LinkL2"/>
+        <exclude body1="LinkL2"    body2="LinkL3"/>
+        <exclude body1="LinkL3"    body2="Gripper_b"/>
+        <exclude body1="Hindarm_a" body2="Hindarm_b"/>
+        <!-- Target exclusions — arms can push it, ground cannot -->
+        <exclude body1="platform"  body2="Target"/>
+    </contact>
+
+    <worldbody>
+        <light name="light1" pos="0 0 5" dir="0 0 -1"
+               diffuse="0.9 0.9 1.0" specular="0.3 0.3 0.3" directional="true"/>
+        <light name="light2" pos="0 -3 3" dir="0 1 -1"
+               diffuse="0.4 0.4 0.6" specular="0.1 0.1 0.1" directional="true"/>
+
+        <geom name="plane_visual" type="box" size="5 5 0.002"
+              pos="0 0 -0.01" material="planemat"
+              contype="0" conaffinity="0"/>
+
+        <body name="Target" pos="0 -0.4 0" euler = "0 0 -45">
+            <joint name="target_x"   type="slide" axis="1 0 0" damping="0"/>
+            <joint name="target_y"   type="slide" axis="0 1 0" damping="0"/>
+            <joint name="target_rz"  type="hinge" axis="0 0 1" damping="0"/>
+            <inertial pos="0 0 0" mass="1.0" diaginertia="0.05 0.05 0.08"/>
+            <geom type="mesh" mesh="Target"
+                  pos="0 0 0" rgba="0.92 0.60 0.20 1"
+                  contype="2" conaffinity="3"/>
+        </body>
+
+        <body name="platform" pos="0.025 0 0">
+
+            <joint name="base_x"  type="slide" axis="1 0 0" damping="0"/>
+            <joint name="base_y"  type="slide" axis="0 1 0" damping="0"/>
+            <joint name="base_rz" type="hinge" axis="0 0 1" damping="0"/>
+
+            <inertial pos="0 0 0.02" mass="8.0" diaginertia="0.15 0.15 0.10"/>
+
+            <geom type="mesh" mesh="RobotBase"
+                  pos="0 0 0" rgba="0.55 0.60 0.75 1"
+                  density="2700"
+                  contype="1" conaffinity="1"/>
+
+            <body name="Hindarm_a" pos="-0.1750 -0.0900 0.0320" euler="0 0 -90">
+                <joint name="joint_hindarm_a" type="hinge" axis="0 0 1"
+                       pos="0 0 0"
+                       range="-2 2" damping="1.5" stiffness="0"/>
+                <geom type="mesh" mesh="LinkR1"
+                      pos="0.1750 0.0900 -0.0320"
+                      rgba="0.70 0.73 0.85 1"
+                      density="2700"
+                      contype="1" conaffinity="1"/>
+
+                <body name="LinkR2" pos="0 -0.2875 0">
+                    <joint name="joint_forearm_a" type="hinge" axis="0 0 1"
+                           pos="0 0 0"
+                           range="-2 2" damping="1.5" stiffness="0"/>
+                    <geom type="mesh" mesh="LinkR2"
+                          pos="0.1750 0.3775 -0.0320"
+                          rgba="0.70 0.73 0.85 1"
+                          density="2700"
+                          contype="1" conaffinity="1"/>
+
+                    <body name="LinkR3" pos="0 -0.2040 0">
+                        <joint name="joint_hand_a" type="hinge" axis="0 0 1"
+                               pos="0 0 0"
+                               range="-2 2" damping="1.5" stiffness="0"/>
+                        <geom type="mesh" mesh="LinkR3"
+                              pos="0.1750 0.5815 -0.0320"
+                              rgba="0.70 0.73 0.85 1"
+                              density="2700"
+                              contype="1" conaffinity="1"/>
+
+                        <body name="Gripper_a" pos="0 -0.1860 0">
+                            <geom type="mesh" mesh="EE_R"
+                                  pos="0.1750 0.7675 -0.0320"
+                                  rgba="0.85 0.35 0.10 1"
+                                  density="2700"
+                                  contype="1" conaffinity="1"/>
+                            <site name="EE_site_a" pos="0 0 0" size="0.001"/>
+                        </body>
+                    </body>
+                </body>
+            </body>
+
+            <body name="Hindarm_b" pos="0.1250 -0.0900 0.0320" euler="0 0 90">
+                <joint name="joint_hindarm_b" type="hinge" axis="0 0 1"
+                       pos="0 0 0"
+                       range="-2 2" damping="1.5" stiffness="0"/>
+                <geom type="mesh" mesh="LinkL1"
+                      pos="-0.1250 0.0900 -0.0320"
+                      rgba="0.70 0.73 0.85 1"
+                      density="2700"
+                      contype="1" conaffinity="1"/>
+
+                <body name="LinkL2" pos="0 -0.2875 0">
+                    <joint name="joint_forearm_b" type="hinge" axis="0 0 1"
+                           pos="0 0 0"
+                           range="-2 2" damping="1.5" stiffness="0"/>
+                    <geom type="mesh" mesh="LinkL2"
+                          pos="-0.1250 0.3775 -0.0320"
+                          rgba="0.70 0.73 0.85 1"
+                          density="2700"
+                          contype="1" conaffinity="1"/>
+
+                    <body name="LinkL3" pos="0 -0.2040 0">
+                        <joint name="joint_hand_b" type="hinge" axis="0 0 1"
+                               pos="0 0 0"
+                               range="-2 2" damping="1.5" stiffness="0"/>
+                        <geom type="mesh" mesh="LinkL3"
+                              pos="-0.1250 0.5815 -0.0320"
+                              rgba="0.70 0.73 0.85 1"
+                              density="2700"
+                              contype="1" conaffinity="1"/>
+
+                        <body name="Gripper_b" pos="0 -0.1860 0">
+                            <geom type="mesh" mesh="EE_L"
+                                  pos="-0.1250 0.7675 -0.0320"
+                                  rgba="0.85 0.35 0.10 1"
+                                  density="2700"
+                                  contype="1" conaffinity="1"/>
+                            <site name="EE_site_b" pos="0 0 0" size="0.001"/>
+                        </body>
+                    </body>
+                </body>
+            </body>
+
+        </body>
+
+    </worldbody>
+
+    <actuator>
+        <position name="hindarm_ctrl_a" joint="joint_hindarm_a"
+                  kp="8000" kv="150" ctrlrange="-3.14 3.14"/>
+        <position name="forearm_ctrl_a"  joint="joint_forearm_a"
+                  kp="8000" kv="80"  ctrlrange="-3.14 3.14"/>
+        <position name="hand_ctrl_a"     joint="joint_hand_a"
+                  kp="8000"  kv="80"  ctrlrange="-3.14 3.14"/>
+        <position name="hindarm_ctrl_b" joint="joint_hindarm_b"
+                  kp="8000" kv="150" ctrlrange="-3.14 3.14"/>
+        <position name="forearm_ctrl_b"  joint="joint_forearm_b"
+                  kp="8000" kv="80"  ctrlrange="-3.14 3.14"/>
+        <position name="hand_ctrl_b"     joint="joint_hand_b"
+                  kp="8000"  kv="80"  ctrlrange="-3.14 3.14"/>
+
+        <motor name="thruster_x"  joint="base_x"  gear="20" ctrlrange="-1 1"/>
+        <motor name="thruster_y"  joint="base_y"  gear="20" ctrlrange="-1 1"/>
+        <motor name="thruster_rz" joint="base_rz" gear="5"  ctrlrange="-1 1"/>
+    </actuator>
+
+</mujoco>
