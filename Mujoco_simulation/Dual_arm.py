@@ -11,6 +11,7 @@ ARM_IDS  = ["a", "b"]
 L1 = 0.2875
 L2 = 0.2040
 L3 = 0.1860
+omega_given = 10
 
 # Starting phi
 PHI_A_START_DEG  = -180
@@ -18,8 +19,7 @@ PHI_B_START_DEG  = 0
 # Target phi
 PHI_A_TARGET_DEG = 0
 PHI_B_TARGET_DEG = -180
-
-REPLAN_INTERVAL = 10
+REPLAN_INTERVAL = 0.5
 
 # Trajectory parameters
 FREQUENCY       = 500
@@ -126,10 +126,6 @@ def plan_trajectory(current_pos, target_pos,
     )
     dt   = 1.0 / frequency
     N    = len(cartesian_traj)
-    dist = float(np.linalg.norm(target_pos - current_pos))
-    print(f"[Plan] {N} pts | dist={dist:.3f} m | T={total_time:.2f} s | "
-          f"{np.round(current_pos, 4).tolist()} → {np.round(target_pos, 4).tolist()} | "
-          f"phi {np.degrees(start_phi_rad):.1f}° → {np.degrees(target_phi_rad):.1f}°")
     return TrajectoryPlan(
         cartesian_traj=cartesian_traj,
         angle_traj=angle_traj,
@@ -210,6 +206,11 @@ def get_target(model, data, arm_index):
     corner     = pos + rot @ local_off
     return corner[:2]
 
+def set_target_angular_velocity(model: mujoco.MjModel, data: mujoco.MjData, omega: float):
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "target_rz")
+    dof = model.jnt_dofadr[jid]
+    data.qvel[dof] = omega
+
 # TRAJECTORY VISUALISATION
 def _add_segment(scn, p1_xy, p2_xy, rgba, z_height=0.0, width_px=2.0):
     if scn.ngeom >= scn.maxgeom - 4:
@@ -286,6 +287,7 @@ def draw_trajectories(viewer,
 def main():
     model = mujoco.MjModel.from_xml_path(XML_PATH)
     data  = mujoco.MjData(model)
+    set_target_angular_velocity(model, data, omega_given)
     maps  = {arm_id: build_maps(model, arm_id) for arm_id in ARM_IDS}
 
     ee_site  = {arm_id: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE,
@@ -307,7 +309,15 @@ def main():
     target_b   = get_target(model, data, arm_index=1)
 
     plan_a = plan_trajectory(ee_a_world, target_a, current_phi_a, phi_a_target_rad)
+    dist = float(np.linalg.norm(target_a - ee_a_world))
+    print(f"[Plan-A] {plan_a.N} pts | dist={dist:.3f} m | T={plan_a.total_time:.2f} s | "
+          f"{np.round(ee_a_world, 4).tolist()} → {np.round(target_a, 4).tolist()} | "
+          f"phi {np.degrees(current_phi_a):.1f}° → {np.degrees(phi_a_target_rad):.1f}°")
     plan_b = plan_trajectory(ee_b_world, target_b, current_phi_b, phi_b_target_rad)
+    dist = float(np.linalg.norm(target_b - ee_b_world))
+    print(f"[Plan-B] {plan_a.N} pts | dist={dist:.3f} m | T={plan_a.total_time:.2f} s | "
+          f"{np.round(ee_b_world, 4).tolist()} → {np.round(target_b, 4).tolist()} | "
+          f"phi {np.degrees(current_phi_b):.1f}° → {np.degrees(phi_b_target_rad):.1f}°")
     frame_a         = 0
     frame_b         = 0
     sim_time_plan_a = data.time
@@ -328,7 +338,7 @@ def main():
             traj_done_a = frame_a >= plan_a.N - 1
             traj_done_b = frame_b >= plan_b.N - 1
 
-            if traj_done_a or sim_now - last_replan_a >= REPLAN_INTERVAL:
+            if (traj_done_a and traj_done_b) or sim_now - last_replan_a >= REPLAN_INTERVAL:
                 new_target_a = get_target(model, data, arm_index=0)
                 ee_now_a     = data.site_xpos[ee_site["a"]][:2].copy()
                 plan_a = plan_trajectory(ee_now_a, new_target_a,
@@ -336,11 +346,11 @@ def main():
                 frame_a         = 0
                 sim_time_plan_a = sim_now
                 last_replan_a   = sim_now
-                print(f"[Replan-A] → {np.round(new_target_a, 4).tolist()} | "
+                print(f"[Replan-A]: {np.round(ee_now_a, 4).tolist()} → "f"{np.round(new_target_a, 4).tolist()} | "
                       f"phi {np.degrees(current_phi_a):.1f}° → "
                       f"{np.degrees(phi_a_target_rad):.1f}°")
 
-            if traj_done_b or sim_now - last_replan_b >= REPLAN_INTERVAL:
+            if (traj_done_a and traj_done_b) or sim_now - last_replan_b >= REPLAN_INTERVAL:
                 new_target_b = get_target(model, data, arm_index=1)
                 ee_now_b     = data.site_xpos[ee_site["b"]][:2].copy()
                 plan_b = plan_trajectory(ee_now_b, new_target_b,
@@ -348,7 +358,7 @@ def main():
                 frame_b         = 0
                 sim_time_plan_b = sim_now
                 last_replan_b   = sim_now
-                print(f"[Replan-B] → {np.round(new_target_b, 4).tolist()} | "
+                print(f"[Replan-B]: {np.round(ee_now_b, 4).tolist()} → "f"{np.round(new_target_b, 4).tolist()} | "
                       f"phi {np.degrees(current_phi_b):.1f}° → "
                       f"{np.degrees(phi_b_target_rad):.1f}°")
 
