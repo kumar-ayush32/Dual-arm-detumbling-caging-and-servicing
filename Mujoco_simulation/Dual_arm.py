@@ -2,8 +2,10 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import time
+import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Optional
+from Plotting import *
 
 XML_PATH = "Custom_arm.xml"
 ARM_IDS  = ["a", "b"]
@@ -11,7 +13,7 @@ ARM_IDS  = ["a", "b"]
 L1 = 0.2875
 L2 = 0.2040
 L3 = 0.1860
-omega_given = 10
+omega_given = 1
 
 # Starting phi
 PHI_A_START_DEG  = -180
@@ -19,7 +21,7 @@ PHI_B_START_DEG  = 0
 # Target phi
 PHI_A_TARGET_DEG = 0
 PHI_B_TARGET_DEG = -180
-REPLAN_INTERVAL = 0.5
+REPLAN_INTERVAL = 500
 
 # Trajectory parameters
 FREQUENCY       = 500
@@ -284,6 +286,43 @@ def draw_trajectories(viewer,
         _add_sphere(scn, traj[-1], col["target"],
                     z_height=z_h, size=0.012)
 
+def compute_reaction_forces(model: mujoco.MjModel,
+                             data:  mujoco.MjData,
+                             ee_site_ids: dict) -> dict:
+    target_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Target")
+    ee_body    = {arm: int(model.site_bodyid[sid])
+                  for arm, sid in ee_site_ids.items()}
+ 
+    result = {arm: {"force": np.zeros(3), "torque": np.zeros(3)}
+              for arm in ee_site_ids}
+    wrench = np.zeros(6)   # [Fx, Fy, Fz, 0, 0, 0] in contact frame
+ 
+    for i in range(data.ncon):
+        c  = data.contact[i]
+        b1 = int(model.geom_bodyid[c.geom1])
+        b2 = int(model.geom_bodyid[c.geom2])
+ 
+        mujoco.mj_contactForce(model, data, i, wrench)
+        rot     = c.frame.reshape(3, 3)
+        f_world = rot.T @ wrench[:3]
+ 
+        for arm, ee_bid in ee_body.items():
+            if b1 == ee_bid and b2 == target_bid:
+                sign = +1.0
+            elif b1 == target_bid and b2 == ee_bid:
+                sign = -1.0
+            else:
+                continue
+ 
+            f_ee = sign * f_world
+            r        = c.pos - data.xipos[ee_bid]
+            t_ee     = np.cross(r, f_ee)
+ 
+            result[arm]["force"]  += f_ee
+            result[arm]["torque"] += t_ee
+ 
+    return result
+
 def main():
     model = mujoco.MjModel.from_xml_path(XML_PATH)
     data  = mujoco.MjData(model)
@@ -328,75 +367,100 @@ def main():
     t0     = time.perf_counter()
     sim_t0 = data.time
 
+    replanning_start_bit = 0
+    all_angle_armA = []
+    all_angle_armB = []
+    rxn_forces_a   = []
+    rxn_forces_b   = []
+    rxn_torques_a  = []
+    rxn_torques_b  = []
     with mujoco.viewer.launch_passive(model, data) as viewer:
-        while viewer.is_running():
-            sim_now = data.time
-            qpos_adr_a, act_id_a = maps["a"]
-            qpos_adr_b, act_id_b = maps["b"]
-            origin_a = data.xanchor[sh_joint["a"]][:2].copy()
-            origin_b = data.xanchor[sh_joint["b"]][:2].copy()
-            traj_done_a = frame_a >= plan_a.N - 1
-            traj_done_b = frame_b >= plan_b.N - 1
+        try:
+            while viewer.is_running():
+                sim_now = data.time
+                qpos_adr_a, act_id_a = maps["a"]
+                qpos_adr_b, act_id_b = maps["b"]
+                origin_a = data.xanchor[sh_joint["a"]][:2].copy()
+                origin_b = data.xanchor[sh_joint["b"]][:2].copy()
+                traj_done_a = frame_a >= plan_a.N - 1
+                traj_done_b = frame_b >= plan_b.N - 1
 
-            if (traj_done_a and traj_done_b) or sim_now - last_replan_a >= REPLAN_INTERVAL:
-                new_target_a = get_target(model, data, arm_index=0)
-                ee_now_a     = data.site_xpos[ee_site["a"]][:2].copy()
-                plan_a = plan_trajectory(ee_now_a, new_target_a,
-                                         current_phi_a, phi_a_target_rad)
-                frame_a         = 0
-                sim_time_plan_a = sim_now
-                last_replan_a   = sim_now
-                print(f"[Replan-A]: {np.round(ee_now_a, 4).tolist()} → "f"{np.round(new_target_a, 4).tolist()} | "
-                      f"phi {np.degrees(current_phi_a):.1f}° → "
-                      f"{np.degrees(phi_a_target_rad):.1f}°")
+                if (traj_done_a and traj_done_b) or sim_now - last_replan_a >= REPLAN_INTERVAL:
+                    replanning_start_bit = 1
+                    new_target_a = get_target(model, data, arm_index=0)
+                    ee_now_a     = data.site_xpos[ee_site["a"]][:2].copy()
+                    plan_a = plan_trajectory(ee_now_a, new_target_a,
+                                            current_phi_a, phi_a_target_rad)
+                    frame_a         = 0
+                    sim_time_plan_a = sim_now
+                    last_replan_a   = sim_now
+                    print(f"[Replan-A]: {np.round(ee_now_a, 4).tolist()} → "f"{np.round(new_target_a, 4).tolist()} | "
+                        f"phi {np.degrees(current_phi_a):.1f}° → "
+                        f"{np.degrees(phi_a_target_rad):.1f}°")
 
-            if (traj_done_a and traj_done_b) or sim_now - last_replan_b >= REPLAN_INTERVAL:
-                new_target_b = get_target(model, data, arm_index=1)
-                ee_now_b     = data.site_xpos[ee_site["b"]][:2].copy()
-                plan_b = plan_trajectory(ee_now_b, new_target_b,
-                                         current_phi_b, phi_b_target_rad)
-                frame_b         = 0
-                sim_time_plan_b = sim_now
-                last_replan_b   = sim_now
-                print(f"[Replan-B]: {np.round(ee_now_b, 4).tolist()} → "f"{np.round(new_target_b, 4).tolist()} | "
-                      f"phi {np.degrees(current_phi_b):.1f}° → "
-                      f"{np.degrees(phi_b_target_rad):.1f}°")
+                if (traj_done_a and traj_done_b) or sim_now - last_replan_b >= REPLAN_INTERVAL:
+                    replanning_start_bit = 1
+                    new_target_b = get_target(model, data, arm_index=1)
+                    ee_now_b     = data.site_xpos[ee_site["b"]][:2].copy()
+                    plan_b = plan_trajectory(ee_now_b, new_target_b,
+                                            current_phi_b, phi_b_target_rad)
+                    frame_b         = 0
+                    sim_time_plan_b = sim_now
+                    last_replan_b   = sim_now
+                    print(f"[Replan-B]: {np.round(ee_now_b, 4).tolist()} → "f"{np.round(new_target_b, 4).tolist()} | "
+                        f"phi {np.degrees(current_phi_b):.1f}° → "
+                        f"{np.degrees(phi_b_target_rad):.1f}°")
+                
+                if replanning_start_bit and np.linalg.norm(new_target_a - ee_now_a) > np.sqrt(2)*(L1+L2+L3) and np.linalg.norm(new_target_b - ee_now_b) > np.sqrt(2)*(L1+L2+L3):
+                    break
 
-            frame_a = min(int((sim_now - sim_time_plan_a) / plan_a.dt), plan_a.N - 1)
-            frame_b = min(int((sim_now - sim_time_plan_b) / plan_b.dt), plan_b.N - 1)
+                frame_a = min(int((sim_now - sim_time_plan_a) / plan_a.dt), plan_a.N - 1)
+                frame_b = min(int((sim_now - sim_time_plan_b) / plan_b.dt), plan_b.N - 1)
 
-            current_phi_a = float(plan_a.angle_traj[frame_a])
-            current_phi_b = float(plan_b.angle_traj[frame_b])
+                current_phi_a = float(plan_a.angle_traj[frame_a])
+                current_phi_b = float(plan_b.angle_traj[frame_b])
 
-            # IK and control
-            wp_a      = plan_a.cartesian_traj[frame_a]
-            phi_a_now = plan_a.angle_traj[frame_a]
-            q_a       = solve_ik_a(wp_a, phi_a_now, origin_a, elbow_up=False)
+                # IK and control
+                wp_a      = plan_a.cartesian_traj[frame_a]
+                phi_a_now = plan_a.angle_traj[frame_a]
+                q_a       = solve_ik_a(wp_a, phi_a_now, origin_a, elbow_up=False)
+                all_angle_armA.append(q_a)
+                wp_b      = plan_b.cartesian_traj[frame_b]
+                phi_b_now = plan_b.angle_traj[frame_b]
+                q_b       = solve_ik_b(wp_b, phi_b_now, origin_b, elbow_up=True)
+                all_angle_armB.append(q_b)
 
-            wp_b      = plan_b.cartesian_traj[frame_b]
-            phi_b_now = plan_b.angle_traj[frame_b]
-            q_b       = solve_ik_b(wp_b, phi_b_now, origin_b, elbow_up=True)
+                for name, val in zip(["hindarm_ctrl_a", "forearm_ctrl_a", "hand_ctrl_a"], q_a):
+                    data.ctrl[act_id_a[name]] = val
+                for name, val in zip(["hindarm_ctrl_b", "forearm_ctrl_b", "hand_ctrl_b"], q_b):
+                    data.ctrl[act_id_b[name]] = val
 
-            for name, val in zip(["hindarm_ctrl_a", "forearm_ctrl_a", "hand_ctrl_a"], q_a):
-                data.ctrl[act_id_a[name]] = val
-            for name, val in zip(["hindarm_ctrl_b", "forearm_ctrl_b", "hand_ctrl_b"], q_b):
-                data.ctrl[act_id_b[name]] = val
+                mujoco.mj_step(model, data)
 
-            mujoco.mj_step(model, data)
+                # Record reaction forces
+                rxn = compute_reaction_forces(model, data, ee_site)
+                rxn_forces_a.append(rxn["a"]["force"].copy())
+                rxn_forces_b.append(rxn["b"]["force"].copy())
+                rxn_torques_a.append(rxn["a"]["torque"].copy())
+                rxn_torques_b.append(rxn["b"]["torque"].copy())
 
-            z_a = float(data.xanchor[sh_joint["a"]][2])
-            z_b = float(data.xanchor[sh_joint["b"]][2])
-            draw_trajectories(viewer,
-                              plan_a, frame_a,
-                              plan_b, frame_b,
-                              z_height_a=z_a,
-                              z_height_b=z_b)
-            viewer.sync()
-            elapsed_sim  = data.time - sim_t0
-            elapsed_wall = time.perf_counter() - t0
-            sleep_t = elapsed_sim - elapsed_wall
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+
+                z_a = float(data.xanchor[sh_joint["a"]][2])
+                z_b = float(data.xanchor[sh_joint["b"]][2])
+                draw_trajectories(viewer, plan_a, frame_a, plan_b, frame_b,
+                                z_height_a=z_a, z_height_b=z_b)
+                viewer.sync()
+                elapsed_sim  = data.time - sim_t0
+                elapsed_wall = time.perf_counter() - t0
+                sleep_t = elapsed_sim - elapsed_wall
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+        finally:
+            print("[Info] Object went out of reach")
+            viewer.close()
+            plot_angles(all_angle_armA, all_angle_armB)
+            plot_reaction_forces(rxn_forces_a, rxn_forces_b)
+            plot_reaction_torques(rxn_torques_a, rxn_torques_b)
 
 if __name__ == "__main__":
     main()
