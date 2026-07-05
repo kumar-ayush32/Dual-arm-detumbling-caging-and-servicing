@@ -22,13 +22,13 @@ PHI_B_START_DEG  = 0
 PHI_A_TARGET_DEG = 0
 PHI_B_TARGET_DEG = -180
 
-MIM = 0.10                 # apparent mass
-DIM = 1.50                 # apparent damping
-KIM = 10.0                 # apparent stiffness
-IMPEDANCE_MAX_VEL        = 0.25
+MIM = 0.10                          # apparent mass
+DIM = 1.50                          # apparent damping
+KIM = 10.0                          # apparent stiffness
+IMPEDANCE_MAX_VEL        = 0.25     # m/s, safety clamp on impedance velocity command
 IMPEDANCE_MAX_DEFLECTION = 0.03
 
-EQ_TRACK_VEL      = 0.20
+EQ_TRACK_VEL      = 0.20            # m/s
 CONTACT_FORCE_EPS = 0.05
 
 FIRST_CONTACT_FORCE_EPS   = 0.15
@@ -38,6 +38,21 @@ MIN_CONTACTS_BEFORE_CAGE  = 4
 KIM_CAPTURE               = 60.0
 KIM_RAMP_RATE             = 40.0
 CAPTURE_HOLD_TIME         = 1.0
+CAGE_TRACK_VEL             = 0.35   # m/s, faster equilibrium-closing speed once caging
+CAGE_CONTACT_FORCE_EPS     = 1.0    # N, keep closing until a firm grip force is felt
+TARGET_LINVEL_EPS   = 0.03          # m/s, target COM speed below this = "translationally settled"
+TRACK_VEL_MARGIN     = 0.15         # m/s, tracking speed = target speed + this margin
+MAX_TRACK_VEL         = 0.70        # m/s, safety cap on the dynamic tracking speed
+TRACK_LEAD_TIME       = 0.05        # s, how far ahead to aim the pursuit point
+CAGE_ABORT_LINVEL     = 0.15        # m/s
+
+CAGE_ENTER_HOLD        = 0.10       # s, settle condition must hold this long before entering caging
+CAGE_ABORT_HOLD        = 0.15       # s, escape condition must hold this long before aborting caging
+MAX_JOINT_VEL          = 2.0        # rad/s, symmetric per-arm joint speed cap (impedance mode only)
+
+NEAR_TARGET_DIST      = 0.05        # m, proximity threshold that triggers the slowdown
+NEAR_TARGET_VEL       = 0.15        # m/s, reduced closing speed once inside NEAR_TARGET_DIST
+FREEZE_AFTER_CONTACT_COUNT = 6
 
 # Trajectory parameters
 FREQUENCY       = 500
@@ -102,17 +117,6 @@ def impedance_update(imp: ImpedanceState, force_xy: np.ndarray, dt: float,
     """Mass-spring-damper impedance law (Eq. 3): given a measured contact
     force, advances the internal impedance state (imp.vel, imp.delta_pos)
     in place and returns the (clamped) compliant velocity.
-
-    imp.delta_pos is the displacement from imp.eq_pos — the position the
-    arm was at when impedance mode activated. The caller should command
-    imp.eq_pos + imp.delta_pos, NOT integrate from the live measured
-    position, so the compliant motion always starts exactly at eq_pos
-    (delta_pos == 0) with zero jump.
-
-    ADDED: `kim` is now a parameter (defaults to the module-level KIM)
-    instead of always reading the global constant, so callers can ramp
-    stiffness at runtime (capture stiffening) without touching this
-    function's core physics.
     """
     accel = (force_xy - DIM * imp.vel - kim * imp.delta_pos) / MIM
     imp.vel += accel * dt
@@ -283,9 +287,10 @@ def get_target(model, data, arm_index):
     corner     = pos + rot @ local_off
     return corner[:2]
 
-def get_target_corner_live(model, data, arm_index):
-    bid  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Target")
-    gid  = next(i for i in range(model.ngeom) if model.geom_bodyid[i] == bid)
+def get_target_corner_live(model, data, arm_index, gid=None):
+    if gid is None:
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Target")
+        gid = next(i for i in range(model.ngeom) if model.geom_bodyid[i] == bid)
     sign = 1 if arm_index == 0 else -1
     sx, sy, sz = model.geom_size[gid][:3]
     local_off  = np.array([sign * sx, sign * sy, sign * sz])
@@ -299,10 +304,18 @@ def set_target_angular_velocity(model: mujoco.MjModel, data: mujoco.MjData, omeg
     dof = model.jnt_dofadr[jid]
     data.qvel[dof] = omega
 
-def get_target_angular_velocity(model: mujoco.MjModel, data: mujoco.MjData) -> float:
-    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "target_rz")
-    dof = model.jnt_dofadr[jid]
+def get_target_angular_velocity(model: mujoco.MjModel, data: mujoco.MjData, dof=None):
+    if dof is None:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "target_rz")
+        dof = model.jnt_dofadr[jid]
     return float(data.qvel[dof])
+
+def get_target_planar_velocity(model: mujoco.MjModel, data: mujoco.MjData, bid: int):
+    res = np.zeros(6)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY, bid, res, 0)
+    omega_z    = float(res[2])
+    lin_vel_xy = np.array([res[3], res[4]])
+    return omega_z, lin_vel_xy
 
 # TRAJECTORY VISUALISATION
 def _add_segment(scn, p1_xy, p2_xy, rgba, z_height=0.0, width_px=2.0):
@@ -379,10 +392,14 @@ def draw_trajectories(viewer,
 
 def compute_reaction_forces(model: mujoco.MjModel,
                              data:  mujoco.MjData,
-                             ee_site_ids: dict) -> dict:
-    target_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Target")
-    ee_body    = {arm: int(model.site_bodyid[sid])
-                  for arm, sid in ee_site_ids.items()}
+                             ee_site_ids: dict,
+                             target_bid: int = None,
+                             ee_body: dict = None) -> dict:
+    if target_bid is None:
+        target_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Target")
+    if ee_body is None:
+        ee_body = {arm: int(model.site_bodyid[sid])
+                   for arm, sid in ee_site_ids.items()}
  
     result = {arm: {"force": np.zeros(3), "torque": np.zeros(3)}
               for arm in ee_site_ids}
@@ -427,6 +444,11 @@ def main():
     sh_joint = {arm_id: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT,
                                            f"joint_hindarm_{arm_id}")
                 for arm_id in ARM_IDS}
+    _target_bid    = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Target")
+    _target_gid    = next(i for i in range(model.ngeom) if model.geom_bodyid[i] == _target_bid)
+    _target_rz_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "target_rz")
+    _target_rz_dof = model.jnt_dofadr[_target_rz_jid]
+    _ee_body       = {arm: int(model.site_bodyid[sid]) for arm, sid in ee_site.items()}
 
     mujoco.mj_forward(model, data)
     phi_a_target_rad = np.deg2rad(PHI_A_TARGET_DEG)
@@ -468,13 +490,20 @@ def main():
     frozen_wp_b       = None
     frozen_phi_a      = None
     frozen_phi_b      = None
+    settle_since      = None
+    escape_since      = None
+    near_target_flag  = {"a": False, "b": False}
+    frozen_after_contacts = False
+    frozen_q_a            = None
+    frozen_q_b            = None
+    q_a_prev = None
+    q_b_prev = None
     all_angle_armA = []
     all_angle_armB = []
     rxn_forces_a   = []
     rxn_forces_b   = []
     rxn_torques_a  = []
     rxn_torques_b  = []
-
     with mujoco.viewer.launch_passive(model, data) as viewer:
         try:
             while viewer.is_running():
@@ -508,6 +537,13 @@ def main():
                     frozen_wp_b       = None
                     frozen_phi_a      = None
                     frozen_phi_b      = None
+                    settle_since      = None
+                    escape_since      = None
+                    near_target_flag["a"] = False
+                    near_target_flag["b"] = False
+                    frozen_after_contacts = False
+                    frozen_q_a            = None
+                    frozen_q_b            = None
                     print(f"[Impedance] activated at t={sim_now:.2f}s | "
                           f"both arms reached target region → compliant contact mode")
 
@@ -519,6 +555,9 @@ def main():
 
                 # IK and control
                 if impedance_mode:
+                    omega_target, target_lin_vel = get_target_planar_velocity(model, data, _target_bid)
+                    lin_speed    = float(np.linalg.norm(target_lin_vel))
+                    settled_now = (abs(omega_target) < DETUMBLE_OMEGA_EPS) and (lin_speed < TARGET_LINVEL_EPS)
                     f_a = rxn_forces_a[-1][:2] if rxn_forces_a else np.zeros(2)
                     f_b = rxn_forces_b[-1][:2] if rxn_forces_b else np.zeros(2)
                     a_now_contact = np.linalg.norm(f_a) > FIRST_CONTACT_FORCE_EPS
@@ -528,25 +567,61 @@ def main():
                         if active_arm == "a" and a_now_contact and not imp_st["a"].was_in_contact:
                             contact_count += 1
                             active_arm = "b"
+                            near_target_flag["a"] = False
                             print(f"[Impedance] contact #{contact_count} (arm a) at t={sim_now:.2f}s "
                                   f"→ hand-off to arm b")
+                            print("Current Omega:", omega_target, "| Current linear speed:", lin_speed)
                         elif active_arm == "b" and b_now_contact and not imp_st["b"].was_in_contact:
                             contact_count += 1
                             active_arm = "a"
+                            near_target_flag["b"] = False
                             print(f"[Impedance] contact #{contact_count} (arm b) at t={sim_now:.2f}s "
                                   f"→ hand-off to arm a")
+                            print("Current Omega:", omega_target, "| Current linear speed:", lin_speed)
                     imp_st["a"].was_in_contact = a_now_contact
                     imp_st["b"].was_in_contact = b_now_contact
 
-                    omega_target = abs(get_target_angular_velocity(model, data))
-                    if not caging_mode and contact_count >= MIN_CONTACTS_BEFORE_CAGE \
-                            and omega_target < DETUMBLE_OMEGA_EPS:
-                        caging_mode = True
-                        caging_start_time = sim_now
-                        print(f"[Impedance] target detumbled (|omega|={omega_target:.3f} rad/s) "
-                              f"after {contact_count} contacts → caging mode, both arms close in")
+                    if not frozen_after_contacts and contact_count > FREEZE_AFTER_CONTACT_COUNT:
+                        frozen_after_contacts = True
+                        frozen_q_a = q_a_prev.copy() if q_a_prev is not None else None
+                        frozen_q_b = q_b_prev.copy() if q_b_prev is not None else None
+                        print(f"[Impedance] contact_count={contact_count} > {FREEZE_AFTER_CONTACT_COUNT} "
+                              f"at t={sim_now:.2f}s → freezing both arms at current joint angles")
 
-                    if caging_mode and not captured and \
+                    if not frozen_after_contacts and contact_count >= MIN_CONTACTS_BEFORE_CAGE:
+                        if settled_now:
+                            if settle_since is None:
+                                settle_since = sim_now
+                            elif (sim_now - settle_since) >= CAGE_ENTER_HOLD:
+                                caging_mode   = True
+                                caging_start_time = sim_now
+                                settle_since  = None
+                                print(f"[Impedance] target settled (|omega|={omega_target:.3f} rad/s, "
+                                      f"|v|={lin_speed:.3f} m/s) after {contact_count} contacts "
+                                      f"→ caging mode, both arms close in")
+                        else:
+                            settle_since = None
+                    else:
+                        settle_since = None
+
+                    escaped_now = lin_speed > CAGE_ABORT_LINVEL
+                    if caging_mode and not captured and not frozen_after_contacts:
+                        if escaped_now:
+                            if escape_since is None:
+                                escape_since = sim_now
+                            elif (sim_now - escape_since) >= CAGE_ABORT_HOLD:
+                                caging_mode   = False
+                                contact_count = 0
+                                escape_since  = None
+                                print(f"[Impedance] target escaped caging (|v|={lin_speed:.3f} m/s) "
+                                      f"at t={sim_now:.2f}s → reverting to sequential detumbling "
+                                      f"(contact count reset)")
+                        else:
+                            escape_since = None
+                    else:
+                        escape_since = None
+
+                    if caging_mode and not captured and not frozen_after_contacts and \
                             (sim_now - caging_start_time) >= CAPTURE_HOLD_TIME:
                         captured     = True
                         frozen_wp_a  = (imp_st["a"].eq_pos + imp_st["a"].delta_pos).copy()
@@ -556,7 +631,12 @@ def main():
                         print(f"[Impedance] capture confirmed at t={sim_now:.2f}s "
                               f"→ arms locked, holding position")
 
-                    if captured:
+                    if frozen_after_contacts:
+                        wp_a      = imp_st["a"].eq_pos + imp_st["a"].delta_pos
+                        phi_a_now = current_phi_a
+                        wp_b      = imp_st["b"].eq_pos + imp_st["b"].delta_pos
+                        phi_b_now = current_phi_b
+                    elif captured:
                         wp_a      = frozen_wp_a
                         phi_a_now = frozen_phi_a
                         wp_b      = frozen_wp_b
@@ -564,22 +644,60 @@ def main():
                     else:
                         track_a = caging_mode or (active_arm == "a")
                         track_b = caging_mode or (active_arm == "b")
+                        base_track_vel_a = CAGE_TRACK_VEL if caging_mode else EQ_TRACK_VEL
+                        base_track_vel_b = CAGE_TRACK_VEL if caging_mode else EQ_TRACK_VEL
+                        force_eps_a      = CAGE_CONTACT_FORCE_EPS if caging_mode else CONTACT_FORCE_EPS
+                        force_eps_b      = CAGE_CONTACT_FORCE_EPS if caging_mode else CONTACT_FORCE_EPS
 
-                        if track_a and np.linalg.norm(f_a) < CONTACT_FORCE_EPS:
-                            corner_a = get_target_corner_live(model, data, arm_index=0)
+                        track_vel_a = float(np.clip(lin_speed + TRACK_VEL_MARGIN,
+                                                     base_track_vel_a, MAX_TRACK_VEL))
+                        track_vel_b = float(np.clip(lin_speed + TRACK_VEL_MARGIN,
+                                                     base_track_vel_b, MAX_TRACK_VEL))
+                        lead_offset = target_lin_vel * TRACK_LEAD_TIME
+
+                        if track_a:
+                            corner_a = get_target_corner_live(model, data, arm_index=0, gid=_target_gid)
+                            corner_a = corner_a + lead_offset
+                            ee_a_now = data.site_xpos[ee_site["a"]][:2]
+                            dist_to_target_a = float(np.linalg.norm(corner_a - ee_a_now))
+                            if dist_to_target_a < NEAR_TARGET_DIST:
+                                track_vel_a = NEAR_TARGET_VEL
+                                if not near_target_flag["a"]:
+                                    near_target_flag["a"] = True
+                                    print(f"[Impedance] arm a within {NEAR_TARGET_DIST:.3f} m of target "
+                                          f"(d={dist_to_target_a:.3f} m) at t={sim_now:.2f}s "
+                                          f"→ closing speed reduced to {NEAR_TARGET_VEL:.3f} m/s")
+                            else:
+                                near_target_flag["a"] = False
+
+                        if track_b:
+                            corner_b = get_target_corner_live(model, data, arm_index=1, gid=_target_gid)
+                            corner_b = corner_b + lead_offset
+                            ee_b_now = data.site_xpos[ee_site["b"]][:2]
+                            dist_to_target_b = float(np.linalg.norm(corner_b - ee_b_now))
+                            if dist_to_target_b < NEAR_TARGET_DIST:
+                                track_vel_b = NEAR_TARGET_VEL
+                                if not near_target_flag["b"]:
+                                    near_target_flag["b"] = True
+                                    print(f"[Impedance] arm b within {NEAR_TARGET_DIST:.3f} m of target "
+                                          f"(d={dist_to_target_b:.3f} m) at t={sim_now:.2f}s "
+                                          f"→ closing speed reduced to {NEAR_TARGET_VEL:.3f} m/s")
+                            else:
+                                near_target_flag["b"] = False
+
+                        if track_a and np.linalg.norm(f_a) < force_eps_a:
                             dir_a    = corner_a - imp_st["a"].eq_pos
                             dist_a   = np.linalg.norm(dir_a)
                             if dist_a > 1e-4:
                                 imp_st["a"].eq_pos = imp_st["a"].eq_pos + \
-                                    dir_a / dist_a * min(EQ_TRACK_VEL * impedance_dt, dist_a)
+                                    dir_a / dist_a * min(track_vel_a * impedance_dt, dist_a)
 
-                        if track_b and np.linalg.norm(f_b) < CONTACT_FORCE_EPS:
-                            corner_b = get_target_corner_live(model, data, arm_index=1)
+                        if track_b and np.linalg.norm(f_b) < force_eps_b:
                             dir_b    = corner_b - imp_st["b"].eq_pos
                             dist_b   = np.linalg.norm(dir_b)
                             if dist_b > 1e-4:
                                 imp_st["b"].eq_pos = imp_st["b"].eq_pos + \
-                                    dir_b / dist_b * min(EQ_TRACK_VEL * impedance_dt, dist_b)
+                                    dir_b / dist_b * min(track_vel_b * impedance_dt, dist_b)
 
                         target_kim = KIM_CAPTURE if caging_mode else KIM
                         step       = KIM_RAMP_RATE * impedance_dt
@@ -602,8 +720,30 @@ def main():
                     phi_b_now = plan_b.angle_traj[frame_b]
 
                 q_a       = solve_ik_a(wp_a, phi_a_now, origin_a, elbow_up=False)
-                all_angle_armA.append(q_a)
                 q_b       = solve_ik_b(wp_b, phi_b_now, origin_b, elbow_up=True)
+
+                if frozen_after_contacts:
+                    if frozen_q_a is not None:
+                        q_a = frozen_q_a.copy()
+                    if frozen_q_b is not None:
+                        q_b = frozen_q_b.copy()
+
+                if impedance_mode:
+                    max_step = MAX_JOINT_VEL * impedance_dt
+                    if q_a_prev is not None:
+                        step_a = q_a - q_a_prev
+                        smag_a = np.linalg.norm(step_a)
+                        if smag_a > max_step:
+                            q_a = q_a_prev + step_a / smag_a * max_step
+                    if q_b_prev is not None:
+                        step_b = q_b - q_b_prev
+                        smag_b = np.linalg.norm(step_b)
+                        if smag_b > max_step:
+                            q_b = q_b_prev + step_b / smag_b * max_step
+                q_a_prev = q_a.copy()
+                q_b_prev = q_b.copy()
+
+                all_angle_armA.append(q_a)
                 all_angle_armB.append(q_b)
 
                 for name, val in zip(["hindarm_ctrl_a", "forearm_ctrl_a", "hand_ctrl_a"], q_a):
@@ -614,7 +754,8 @@ def main():
                 mujoco.mj_step(model, data)
 
                 # Record reaction forces
-                rxn = compute_reaction_forces(model, data, ee_site)
+                rxn = compute_reaction_forces(model, data, ee_site,
+                                               target_bid=_target_bid, ee_body=_ee_body)
                 rxn_forces_a.append(rxn["a"]["force"].copy())
                 rxn_forces_b.append(rxn["b"]["force"].copy())
                 rxn_torques_a.append(rxn["a"]["torque"].copy())
